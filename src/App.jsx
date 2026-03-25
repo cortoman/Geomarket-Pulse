@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import * as Recharts from "recharts";
 import _ from "lodash";
+import GlobeGL from "react-globe.gl";
 
 const { XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Area, AreaChart, BarChart, Bar, Cell, CartesianGrid, ComposedChart, Scatter } = Recharts;
 
@@ -611,23 +612,173 @@ function ImpactPanel({ item, region, T }) {
   );
 }
 
-function Globe({ regions, activeRegion, onSelect, scores, T }) {
-  const [rot, setRot] = useState(0);
-  const [hov, setHov] = useState(null);
-  useEffect(() => { let f; const a = () => { setRot(r => (r + .12) % 360); f = requestAnimationFrame(a); }; if (!hov) f = requestAnimationFrame(a); return () => cancelAnimationFrame(f); }, [hov]);
-  const proj = (lat, lng) => { const l = ((lng + rot) * Math.PI) / 180; const p = (lat * Math.PI) / 180; return { x: 200 + 135 * Math.cos(p) * Math.sin(l), y: 200 - 135 * Math.sin(p), vis: Math.cos(p) * Math.cos(l) > -.15, d: Math.cos(p) * Math.cos(l) }; };
-  const grid = useMemo(() => { const L = []; for (let la = -60; la <= 60; la += 30) { const P = []; for (let lo = 0; lo <= 360; lo += 5) { const p = proj(la, lo - rot); if (p.vis) P.push(`${p.x},${p.y}`); else if (P.length > 1) { L.push(P.join(" ")); P.length = 0; } } if (P.length > 1) L.push(P.join(" ")); } for (let lo = -180; lo <= 180; lo += 30) { const P = []; for (let la = -80; la <= 80; la += 5) { const p = proj(la, lo); if (p.vis) P.push(`${p.x},${p.y}`); else if (P.length > 1) { L.push(P.join(" ")); P.length = 0; } } if (P.length > 1) L.push(P.join(" ")); } return L; }, [rot]);
+function Globe({ regions, activeRegion, onSelect, onHover, scores, allNews, flyRef }) {
+  const globeRef = useRef();
+  const containerRef = useRef();
+  const [countries, setCountries] = useState({ features: [] });
+  const [dims, setDims] = useState({ w: 800, h: 600 });
+  const hovRef = useRef(null); // track current hover to avoid redundant flyTo
+
+  const aliases = useMemo(() => ({
+    "united arab emirates": "UAE", "united kingdom": "UK",
+    "united states of america": "United States", "dem. rep. congo": "DRC",
+    "democratic republic of the congo": "DRC", "congo, the democratic republic of the": "DRC",
+    "korea, republic of": "South Korea", "korea, democratic people's republic of": "North Korea",
+  }), []);
+
+  const countryToRegion = useMemo(() => {
+    const map = {};
+    Object.entries(regions).forEach(([rn, rd]) => {
+      rd.countries.forEach(c => {
+        map[c.name.toLowerCase()] = rn;
+        Object.entries(aliases).forEach(([full, short]) => {
+          if (short === c.name) map[full] = rn;
+        });
+      });
+    });
+    return map;
+  }, [regions, aliases]);
+
+  // Responsive sizing — fill entire container
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      if (w > 0 && h > 0) setDims({ w, h });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    fetch("https://raw.githubusercontent.com/vasturiano/react-globe.gl/master/example/datasets/ne_110m_admin_0_countries.geojson")
+      .then(r => r.json()).then(setCountries).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (globeRef.current && countries.features.length) {
+      globeRef.current.controls().autoRotate = true;
+      globeRef.current.controls().autoRotateSpeed = 0.3;
+      globeRef.current.controls().enableDamping = true;
+      globeRef.current.controls().dampingFactor = 0.15;
+      globeRef.current.pointOfView({ lat: 20, lng: 0, altitude: 2.2 });
+    }
+  }, [countries.features.length]);
+
+  // Fly to region — slow, smooth animation to avoid overshooting
+  const flyToRegion = useCallback((regionName) => {
+    if (!globeRef.current) return;
+    if (regionName && regions[regionName]) {
+      hovRef.current = regionName;
+      globeRef.current.controls().autoRotate = false;
+      const { lat, lng } = regions[regionName];
+      globeRef.current.pointOfView({ lat, lng, altitude: 1.8 }, 1400);
+    } else {
+      hovRef.current = null;
+      globeRef.current.controls().autoRotate = true;
+      globeRef.current.pointOfView({ altitude: 2.2 }, 1200);
+    }
+  }, [regions]);
+
+  // Expose flyToRegion to parent via ref
+  useEffect(() => {
+    if (flyRef) flyRef.current = flyToRegion;
+  }, [flyRef, flyToRegion]);
+
+  const getRegion = useCallback((feat) => {
+    const name = (feat.properties?.NAME || feat.properties?.ADMIN || "").toLowerCase();
+    if (countryToRegion[name]) return countryToRegion[name];
+    for (const [k, v] of Object.entries(countryToRegion)) {
+      if (name.length > 3 && k.length > 3 && (name.includes(k) || k.includes(name))) return v;
+    }
+    return null;
+  }, [countryToRegion]);
+
+  // Region markers with scores + top headline for on-globe labels
+  const regionMarkers = useMemo(() => {
+    return Object.entries(regions).map(([name, data]) => {
+      const score = scores?.[name] || 0;
+      const topNews = (allNews || []).filter(n => n.region === name).slice(0, 1)[0];
+      return { lat: data.lat, lng: data.lng, name, color: data.color, score, topNews };
+    });
+  }, [regions, scores, allNews]);
+
+  const makeEl = useCallback((d) => {
+    const el = document.createElement("div");
+    el.style.cssText = "pointer-events:auto;cursor:pointer;text-align:center;transform:translate(-50%,-100%)";
+    const scoreLbl = d.score <= 3 ? "LOW" : d.score <= 6 ? "MOD" : d.score <= 8 ? "HIGH" : "CRIT";
+    const scoreHue = 120 - (d.score / 10) * 120;
+    const scoreCol = `hsl(${scoreHue},55%,48%)`;
+    const hl = d.topNews ? d.topNews.headline : "";
+    const hlTrunc = hl.length > 50 ? hl.slice(0, 47) + "..." : hl;
+    const sentCol = d.topNews ? (d.topNews.sentiment < -0.3 ? "#d4605a" : d.topNews.sentiment > 0.3 ? "#5a9e6f" : "#c4993c") : "#666";
+    el.innerHTML = `<div style="background:rgba(15,17,24,0.85);border:1px solid ${d.color}50;border-radius:6px;padding:4px 8px;min-width:100px;max-width:180px;backdrop-filter:blur(6px)">
+      <div style="font-size:10px;font-weight:800;color:${d.color};letter-spacing:0.5px">${d.name}</div>
+      <div style="display:flex;align-items:center;gap:4px;margin-top:2px">
+        <span style="font-size:14px;font-weight:800;color:${scoreCol};font-family:monospace">${d.score.toFixed(1)}</span>
+        <span style="font-size:7px;font-weight:700;color:${scoreCol};letter-spacing:1px">${scoreLbl}</span>
+      </div>
+      ${hlTrunc ? `<div style="font-size:8px;color:#9d9b97;margin-top:3px;line-height:1.3;border-top:1px solid rgba(255,255,255,0.06);padding-top:3px"><span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:${sentCol};margin-right:3px;vertical-align:middle"></span>${hlTrunc}</div>` : ""}
+    </div>`;
+    el.onclick = () => onSelect(d.name);
+    el.onmouseenter = () => {
+      if (hovRef.current !== d.name) {
+        if (onHover) onHover(d.name);
+        flyToRegion(d.name);
+      }
+    };
+    el.onmouseleave = () => {
+      if (onHover) onHover(null);
+      flyToRegion(null);
+    };
+    return el;
+  }, [onSelect, onHover, flyToRegion]);
+
   return (
-    <svg viewBox="0 0 400 400" style={{ width: "100%", maxWidth: 320, margin: "0 auto", display: "block" }}>
-      <circle cx="200" cy="200" r="148" fill={T.sf} stroke={T.bd} />
-      {grid.map((p, i) => <polyline key={i} points={p} fill="none" stroke={T.bd} strokeWidth=".5" />)}
-      {Object.entries(regions).map(([n, c]) => { const p = proj(c.lat, c.lng); if (!p.vis) return null; const risk = scores[n] || 0; const isA = activeRegion === n; const isH = hov === n; const r = 4 + risk * 1.3; return (
-        <g key={n} style={{ cursor: "pointer" }} onClick={() => onSelect(n)} onMouseEnter={() => setHov(n)} onMouseLeave={() => setHov(null)}>
-          <circle cx={p.x} cy={p.y} r={isH || isA ? r + 2 : r} fill={c.color} opacity={(.35 + p.d * .6) * (isA ? 1 : .55)} stroke={isA ? T.t1 : "none"} strokeWidth={isA ? 1.5 : 0} style={{ transition: "all .2s" }} />
-          <text x={p.x} y={p.y - r - 6} textAnchor="middle" style={{ fontSize: isH || isA ? 10 : 8, fill: isA ? c.color : T.t3, fontWeight: 700, fontFamily: FONT }}>{n}</text>
-        </g>
-      ); })}
-    </svg>
+    <div ref={containerRef} style={{ width: "100%", height: "100%", position: "relative" }}>
+      <GlobeGL
+        ref={globeRef}
+        width={dims.w}
+        height={dims.h}
+        globeImageUrl="//unpkg.com/three-globe/example/img/earth-dark.jpg"
+        backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
+        backgroundColor="#0f1118"
+        atmosphereColor="#c9a55a"
+        atmosphereAltitude={0.15}
+        polygonsData={countries.features}
+        polygonCapColor={feat => {
+          const r = getRegion(feat);
+          if (!r) return "rgba(80,80,100,0.12)";
+          return r === activeRegion ? regions[r].color + "cc" : regions[r].color + "55";
+        }}
+        polygonSideColor={() => "rgba(0,0,0,0.08)"}
+        polygonStrokeColor={() => "rgba(255,255,255,0.06)"}
+        polygonAltitude={feat => { const r = getRegion(feat); return r === activeRegion ? 0.02 : 0.005; }}
+        polygonLabel={feat => {
+          const r = getRegion(feat);
+          const name = feat.properties?.NAME || "";
+          return `<div style="background:rgba(15,17,24,0.9);border:1px solid rgba(255,255,255,0.1);padding:4px 8px;border-radius:4px;font-size:11px;color:#e8e6e3;font-family:sans-serif"><b>${name}</b>${r ? `<br/><span style="color:${regions[r]?.color}">${r}</span>` : ""}</div>`;
+        }}
+        onPolygonClick={feat => {
+          const r = getRegion(feat);
+          if (r) onSelect(r);
+        }}
+        onPolygonHover={feat => {
+          const r = feat ? getRegion(feat) : null;
+          if (r && onHover) onHover(r);
+        }}
+        polygonsTransitionDuration={300}
+        htmlElementsData={regionMarkers}
+        htmlLat={d => d.lat}
+        htmlLng={d => d.lng}
+        htmlAltitude={0.06}
+        htmlElement={makeEl}
+      />
+    </div>
   );
 }
 
@@ -655,6 +806,8 @@ export default function App() {
   const [chartType, setChartType] = useState("candle");
   const [showIndicators, setShowIndicators] = useState(true);
   const [dashTab, setDashTab] = useState("chart"); // chart | multi | book
+  const [hovRegion, setHovRegion] = useState(null);
+  const globeFlyRef = useRef(null); // holds Globe's flyToRegion fn
 
   const T = themes[theme];
 
@@ -743,35 +896,80 @@ export default function App() {
           <span style={{ position: "absolute", left: 7, top: "50%", transform: "translateY(-50%)", fontSize: 10, color: T.t4 }}>⌕</span>
         </div>
         <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
-          {["globe","dashboard","watchlist"].map(v => <button key={v} onClick={() => setView(v)} style={btn(view === v)}>{v.charAt(0).toUpperCase() + v.slice(1)}</button>)}
-          <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")} style={{ background: "none", border: `1px solid ${T.bd}`, borderRadius: 4, padding: "4px 8px", cursor: "pointer", fontSize: 11, color: T.t2 }}>{theme === "dark" ? "☀" : "●"}</button>
+          {["globe","dashboard","watchlist","learn"].map(v => <button key={v} onClick={() => setView(v)} style={btn(view === v)}>{v.charAt(0).toUpperCase() + v.slice(1)}</button>)}
         </div>
       </header>
 
       {/* GLOBE */}
       {view === "globe" && (
-        <div className="fu" style={{ display: "grid", gridTemplateColumns: "1fr 320px", minHeight: "calc(100vh - 48px)" }}>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 14 }}>
-            <Globe regions={REGIONS} activeRegion={region} onSelect={r => { setRegion(r); setActiveMarket(REGIONS[r].markets[0].ticker); setView("dashboard"); }} scores={scores} T={T} />
-            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "center", marginTop: 14, maxWidth: 600 }}>
-              {Object.entries(REGIONS).map(([n, c]) => { const r = scores[n] || 0; return (
-                <div key={n} onClick={() => { setRegion(n); setActiveMarket(REGIONS[n].markets[0].ticker); setView("dashboard"); }} style={{ padding: "6px 10px", background: T.sf, border: `1.5px solid ${region === n ? c.color + "35" : T.bd}`, borderRadius: 5, cursor: "pointer", minWidth: 105 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: c.color }} /><span style={{ fontSize: 10, fontWeight: 700, color: region === n ? c.color : T.t2 }}>{n}</span></div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}><span style={{ fontSize: 8, color: T.t4, fontFamily: MONO }}>{c.markets[0].name}</span><span style={{ fontSize: 11, fontWeight: 700, fontFamily: MONO, color: r > 6 ? T.red : r > 3 ? T.yellow : T.green }}>{r.toFixed(1)}</span></div>
-                </div>
-              ); })}
+        <div className="fu" style={{ position: "relative", height: "calc(100vh - 48px)", overflow: "hidden", display: "flex" }}>
+          {/* Globe area */}
+          <div style={{ flex: 1, position: "relative" }}>
+            <Globe regions={REGIONS} activeRegion={region} onSelect={r => { setRegion(r); setActiveMarket(REGIONS[r].markets[0].ticker); setView("dashboard"); }} onHover={r => { setHovRegion(r || region); if (globeFlyRef.current) globeFlyRef.current(r || region); }} scores={scores} allNews={allNews} flyRef={globeFlyRef} />
+            {/* Floating dropdown for region selection */}
+            <div style={{ position: "absolute", top: 12, left: 12, zIndex: 10 }}>
+              <select value={hovRegion || region} onChange={e => { const r = e.target.value; setHovRegion(r); if (globeFlyRef.current) globeFlyRef.current(r); }} style={{ padding: "6px 28px 6px 10px", background: "rgba(15,17,24,0.9)", backdropFilter: "blur(8px)", border: "1px solid rgba(255,255,255,0.12)", borderRadius: 6, color: REGIONS[hovRegion || region]?.color || "#e8e6e3", fontSize: 12, fontWeight: 700, fontFamily: FONT, cursor: "pointer", outline: "none", appearance: "none", WebkitAppearance: "none", backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b6966'/%3E%3C/svg%3E")`, backgroundRepeat: "no-repeat", backgroundPosition: "right 8px center" }}>
+                {Object.keys(REGIONS).map(r => <option key={r} value={r} style={{ background: "#0f1118", color: REGIONS[r].color }}>{r}</option>)}
+              </select>
+              <button onClick={() => { setRegion(hovRegion || region); setActiveMarket(REGIONS[hovRegion || region].markets[0].ticker); setView("dashboard"); }} style={{ marginLeft: 6, padding: "6px 12px", background: (REGIONS[hovRegion || region]?.color || "#E8963E") + "22", border: `1px solid ${(REGIONS[hovRegion || region]?.color || "#E8963E")}44`, borderRadius: 6, color: REGIONS[hovRegion || region]?.color || "#E8963E", fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: FONT }}>Open Dashboard →</button>
             </div>
           </div>
-          <div style={{ borderLeft: `1px solid ${T.bd}`, display: "flex", flexDirection: "column", height: "calc(100vh - 48px)", background: T.sf }}>
-            <div style={{ padding: "8px 12px", borderBottom: `1px solid ${T.bd}`, fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: T.t4 }}>{search ? `SEARCH: "${search}"` : "GLOBAL FEED"}</div>
-            <div style={{ flex: 1, overflowY: "auto" }}>
-              {(search ? globalSearch : allNews.slice(0, 25)).map(it => (
-                <div key={it.id} style={{ padding: "6px 10px", borderBottom: `1px solid ${T.bd}`, cursor: "pointer" }} onClick={() => { setRegion(it.region); setActiveMarket(REGIONS[it.region].markets[0].ticker); setView("dashboard"); }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontSize: 9, fontWeight: 700, color: REGIONS[it.region]?.color }}>{it.region} · {it.country}</span><span style={{ fontSize: 8, color: T.t4, fontFamily: MONO }}>{new Date(it.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div>
-                  <p style={{ fontSize: 11, color: T.t2, margin: "1px 0", lineHeight: 1.3 }}>{it.headline}</p>
+          {/* Always-visible news sidebar */}
+          <div style={{ width: 320, height: "100%", background: "rgba(15,17,24,0.95)", backdropFilter: "blur(12px)", borderLeft: `1px solid ${REGIONS[hovRegion || region]?.color || "#E8963E"}30`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
+            {(() => {
+              const sr = hovRegion || region;
+              const hc = REGIONS[sr];
+              if (!hc) return null;
+              const hn = allNews.filter(n => n.region === sr);
+              const hr = scores[sr] || 0;
+              const neg = hn.filter(n => n.sentiment < -0.2).length;
+              const pos = hn.filter(n => n.sentiment > 0.2).length;
+              const neu = hn.length - neg - pos;
+              return <>
+                <div style={{ padding: "12px 14px", borderBottom: `1px solid rgba(255,255,255,0.06)` }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: hc.color }} />
+                    <span style={{ fontSize: 14, fontWeight: 800, color: hc.color }}>{sr}</span>
+                    <span style={{ marginLeft: "auto", fontSize: 16, fontWeight: 800, fontFamily: MONO, color: hr > 6 ? "#d4605a" : hr > 3 ? "#c4993c" : "#5a9e6f" }}>{hr.toFixed(1)}</span>
+                    <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: 1, color: hr > 6 ? "#d4605a" : hr > 3 ? "#c4993c" : "#5a9e6f" }}>{hr <= 3 ? "LOW" : hr <= 6 ? "MOD" : hr <= 8 ? "HIGH" : "CRIT"}</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, fontSize: 9, fontFamily: MONO }}>
+                    <span style={{ color: "#d4605a" }}>NEG {neg}</span>
+                    <span style={{ color: "#c4993c" }}>NEU {neu}</span>
+                    <span style={{ color: "#5a9e6f" }}>POS {pos}</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 2, height: 3, borderRadius: 2, overflow: "hidden", marginTop: 6 }}>
+                    {hn.length > 0 && <><div style={{ width: `${neg/hn.length*100}%`, background: "#d4605a" }} /><div style={{ width: `${neu/hn.length*100}%`, background: "#c4993c" }} /><div style={{ width: `${pos/hn.length*100}%`, background: "#5a9e6f" }} /></>}
+                  </div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 8 }}>
+                    {hc.markets.map(m => <span key={m.ticker} style={{ fontSize: 8, color: "#6b6966", background: "rgba(255,255,255,0.04)", padding: "2px 5px", borderRadius: 3, fontFamily: MONO }}>{m.name}</span>)}
+                  </div>
                 </div>
-              ))}
-            </div>
+                <div style={{ padding: "6px 10px", fontSize: 8, fontWeight: 700, letterSpacing: 1.5, color: "#6b6966", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>HEADLINES ({hn.length})</div>
+                <div style={{ flex: 1, overflowY: "auto" }}>
+                  {hn.map(it => {
+                    const sc = it.sentiment < -0.3 ? "#d4605a" : it.sentiment > 0.3 ? "#5a9e6f" : "#c4993c";
+                    return (
+                      <div key={it.id} onClick={() => { setRegion(sr); setActiveMarket(REGIONS[sr].markets[0].ticker); setView("dashboard"); }} style={{ padding: "7px 12px", borderBottom: "1px solid rgba(255,255,255,0.04)", cursor: "pointer", borderLeft: `3px solid ${sc}` }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 5, marginBottom: 2 }}>
+                          <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                            <span style={{ fontSize: 8, color: "#6b6966", fontWeight: 600 }}>{it.source}</span>
+                            {it.category && <span style={{ fontSize: 7, color: "#6b6966", background: "rgba(255,255,255,0.05)", padding: "1px 4px", borderRadius: 2, fontWeight: 700, textTransform: "uppercase", letterSpacing: .8 }}>{it.category}</span>}
+                            {it.country && <span style={{ fontSize: 8, color: "#45433f" }}>· {it.country}</span>}
+                          </div>
+                          <span style={{ fontSize: 8, color: "#45433f", fontFamily: MONO }}>{new Date(it.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                        </div>
+                        <p style={{ fontSize: 11, lineHeight: 1.4, color: "#9d9b97", margin: "2px 0 4px", fontWeight: 500 }}>{it.headline}</p>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <span style={{ fontSize: 8, fontWeight: 700, color: sc }}>{it.sentiment > .2 ? "POS" : it.sentiment < -.2 ? "NEG" : "NEU"}</span>
+                          <span style={{ fontSize: 8, color: "#45433f", fontFamily: MONO }}>Impact {it.impact}/10</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>;
+            })()}
           </div>
         </div>
       )}
@@ -790,6 +988,387 @@ export default function App() {
                 <div style={{ height: 38 }}><ResponsiveContainer width="100%" height="100%"><AreaChart data={md} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}><Area type="monotone" dataKey="price" stroke={c.color} strokeWidth={1.5} fill={`${c.color}12`} dot={false} /></AreaChart></ResponsiveContainer></div>
               </div>
             ); })}
+          </div>
+        </div>
+      )}
+
+      {/* LEARN */}
+      {view === "learn" && (
+        <div className="fu" style={{ maxWidth: 860, margin: "0 auto", padding: "24px 24px 48px", overflowY: "auto" }}>
+          <div style={{ marginBottom: 24 }}>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 2, color: T.t4, marginBottom: 4 }}>GEOMARKET PULSE</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: T.t1 }}>Trading Fundamentals</div>
+            <div style={{ fontSize: 12, color: T.t3, marginTop: 4 }}>A visual guide to reading charts, indicators, and market structure</div>
+          </div>
+          <div style={{ fontSize: 11, color: T.t2, lineHeight: 1.6, fontFamily: FONT }}>
+            <div style={{ background: `${T.accent}08`, border: `1px solid ${T.accent}18`, borderRadius: 6, padding: "10px 12px", marginBottom: 20, fontSize: 10, color: T.accent }}>
+              <strong>Disclaimer:</strong> This is educational content only, not financial advice. Technical analysis describes probabilities, not certainties. Markets can and do behave contrary to any pattern. Always manage risk.
+            </div>
+
+            {/* 1. Candlesticks */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>1. What is a Candlestick?</div>
+              <p style={{ margin: "0 0 10px" }}>Each candlestick shows four data points for a time period: <strong>Open</strong> (starting price), <strong>High</strong> (peak), <strong>Low</strong> (trough), and <strong>Close</strong> (ending price).</p>
+              <svg viewBox="0 0 540 270" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Bullish candle */}
+                <line x1="110" y1="25" x2="110" y2="235" stroke={T.green} strokeWidth="2.5" />
+                <rect x="82" y="70" width="56" height="120" fill={T.green} rx="3" opacity="0.9" />
+                <line x1="142" y1="25" x2="175" y2="25" stroke={T.t4} strokeWidth="0.8" strokeDasharray="3 2" />
+                <text x="180" y="29" style={{ fontSize: 10, fill: T.t1, fontFamily: MONO, fontWeight: 700 }}>HIGH</text>
+                <text x="210" y="29" style={{ fontSize: 9, fill: T.t3, fontFamily: FONT }}>— Highest price reached</text>
+                <line x1="142" y1="70" x2="175" y2="55" stroke={T.t4} strokeWidth="0.8" strokeDasharray="3 2" />
+                <text x="180" y="58" style={{ fontSize: 10, fill: T.green, fontFamily: MONO, fontWeight: 700 }}>CLOSE</text>
+                <text x="218" y="58" style={{ fontSize: 9, fill: T.t3, fontFamily: FONT }}>— Price went UP</text>
+                <line x1="78" y1="190" x2="45" y2="190" stroke={T.t4} strokeWidth="0.8" strokeDasharray="3 2" />
+                <text x="10" y="194" style={{ fontSize: 10, fill: T.t2, fontFamily: MONO, fontWeight: 700 }}>OPEN</text>
+                <line x1="142" y1="235" x2="175" y2="235" stroke={T.t4} strokeWidth="0.8" strokeDasharray="3 2" />
+                <text x="180" y="239" style={{ fontSize: 10, fill: T.t1, fontFamily: MONO, fontWeight: 700 }}>LOW</text>
+                <text x="204" y="239" style={{ fontSize: 9, fill: T.t3, fontFamily: FONT }}>— Lowest price reached</text>
+                <text x="63" y="48" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>Upper</text>
+                <text x="65" y="57" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>Wick</text>
+                <text x="65" y="220" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>Lower</text>
+                <text x="65" y="229" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>Wick</text>
+                <text x="92" y="135" style={{ fontSize: 11, fill: "#fff", fontWeight: 700, fontFamily: MONO }}>BODY</text>
+                <text x="55" y="258" style={{ fontSize: 11, fill: T.green, fontWeight: 700 }}>BULLISH (Green)</text>
+                <text x="172" y="258" style={{ fontSize: 10, fill: T.t3 }}>— Closed higher than open</text>
+                {/* Bearish candle */}
+                <line x1="400" y1="25" x2="400" y2="235" stroke={T.red} strokeWidth="2.5" />
+                <rect x="372" y="70" width="56" height="120" fill={T.red} rx="3" opacity="0.9" />
+                <text x="435" y="78" style={{ fontSize: 10, fill: T.red, fontFamily: MONO, fontWeight: 700 }}>OPEN (top)</text>
+                <text x="435" y="196" style={{ fontSize: 10, fill: T.red, fontFamily: MONO, fontWeight: 700 }}>CLOSE (bottom)</text>
+                <text x="375" y="135" style={{ fontSize: 11, fill: "#fff", fontWeight: 700, fontFamily: MONO }}>BODY</text>
+                <text x="340" y="258" style={{ fontSize: 11, fill: T.red, fontWeight: 700 }}>BEARISH (Red)</text>
+                <text x="437" y="258" style={{ fontSize: 10, fill: T.t3 }}>— Closed lower</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>The <strong>body</strong> = open-to-close range. The <strong>wicks</strong> = full range. A long upper wick means sellers pushed price back down. A long lower wick means buyers stepped in. Small body + long wicks = indecision.</p>
+            </div>
+
+            {/* 2. Candle Patterns */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>2. Key Candle Patterns</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 8 }}>
+                {[
+                  { name: "Doji", desc: "Indecision — neither side won", color: T.yellow, render: (T) => <><line x1="50" y1="15" x2="50" y2="85" stroke={T.t2} strokeWidth="2.5" /><rect x="38" y="47" width="24" height="5" fill={T.t2} rx="1" /></> },
+                  { name: "Hammer", desc: "Buyers fought back after dip", color: T.green, render: (T) => <><line x1="50" y1="20" x2="50" y2="85" stroke={T.green} strokeWidth="2.5" /><rect x="36" y="20" width="28" height="22" fill={T.green} rx="2" /></> },
+                  { name: "Shooting Star", desc: "Sellers rejected the high", color: T.red, render: (T) => <><line x1="50" y1="15" x2="50" y2="85" stroke={T.red} strokeWidth="2.5" /><rect x="36" y="63" width="28" height="22" fill={T.red} rx="2" /></> },
+                ].map(p => (
+                  <div key={p.name} style={{ background: `${T.bg}`, border: `1px solid ${T.bd}`, borderRadius: 8, padding: "12px 8px", textAlign: "center" }}>
+                    <svg viewBox="0 0 100 100" style={{ width: 60, height: 60 }}>{p.render(T)}</svg>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: T.t1, marginTop: 4 }}>{p.name}</div>
+                    <div style={{ fontSize: 9, color: p.color, marginTop: 2 }}>{p.desc}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+                {[
+                  { name: "Bullish Engulfing", desc: "Green completely covers red — reversal signal", color: T.green, render: (T) => <><rect x="25" y="35" width="18" height="35" fill={T.red} rx="2" /><line x1="34" y1="28" x2="34" y2="78" stroke={T.red} strokeWidth="1.5" /><rect x="52" y="22" width="26" height="56" fill={T.green} rx="2" /><line x1="65" y1="15" x2="65" y2="85" stroke={T.green} strokeWidth="1.5" /></> },
+                  { name: "Bearish Engulfing", desc: "Red completely covers green — reversal signal", color: T.red, render: (T) => <><rect x="25" y="35" width="18" height="35" fill={T.green} rx="2" /><line x1="34" y1="28" x2="34" y2="78" stroke={T.green} strokeWidth="1.5" /><rect x="52" y="22" width="26" height="56" fill={T.red} rx="2" /><line x1="65" y1="15" x2="65" y2="85" stroke={T.red} strokeWidth="1.5" /></> },
+                ].map(p => (
+                  <div key={p.name} style={{ background: `${T.bg}`, border: `1px solid ${T.bd}`, borderRadius: 8, padding: "12px 8px", textAlign: "center" }}>
+                    <svg viewBox="0 0 100 100" style={{ width: 60, height: 60 }}>{p.render(T)}</svg>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: T.t1, marginTop: 4 }}>{p.name}</div>
+                    <div style={{ fontSize: 9, color: p.color, marginTop: 2 }}>{p.desc}</div>
+                  </div>
+                ))}
+              </div>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>Patterns suggest possible moves but require context. A hammer after a downtrend may signal reversal — but the next candle needs to confirm. One candle alone is never enough.</p>
+            </div>
+
+            {/* 3. Moving Averages — FIXED: proper candlestick chart with MA overlay */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>3. Moving Averages (MA)</div>
+              <p style={{ margin: "0 0 10px" }}>A moving average smooths price data to reveal the trend. A <strong>fast MA</strong> (e.g. 20-period, gold line) reacts quickly. A <strong>slow MA</strong> (e.g. 50-period, red dashed) shows the bigger picture. When they cross, momentum may be shifting.</p>
+              <svg viewBox="0 0 540 220" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Proper candlesticks with OHLC data */}
+                {[
+                  {o:150,h:155,l:138,c:142},{o:142,h:148,l:135,c:145},{o:145,h:152,l:140,c:138},
+                  {o:138,h:145,l:130,c:143},{o:143,h:150,l:137,c:135},{o:135,h:142,l:128,c:140},
+                  {o:140,h:155,l:138,c:152},{o:152,h:160,l:148,c:148},{o:148,h:156,l:142,c:155},
+                  {o:155,h:165,l:150,c:162},{o:162,h:168,l:155,c:158},{o:158,h:162,l:148,c:150},
+                  {o:150,h:158,l:145,c:156},{o:156,h:168,l:152,c:165},{o:165,h:172,l:158,c:160},
+                  {o:160,h:170,l:155,c:168},{o:168,h:178,l:164,c:175},{o:175,h:182,l:170,c:172},
+                  {o:172,h:180,l:168,c:178},{o:178,h:188,l:175,c:185},{o:185,h:192,l:180,c:182},
+                  {o:182,h:190,l:178,c:188},{o:188,h:195,l:184,c:192},{o:192,h:198,l:186,c:195},
+                ].map((c, i) => {
+                  const x = 25 + i * 21;
+                  const bull = c.c >= c.o;
+                  const bodyTop = 210 - Math.max(c.o, c.c);
+                  const bodyH = Math.max(Math.abs(c.c - c.o), 2);
+                  return <g key={i}>
+                    <line x1={x} y1={210 - c.h} x2={x} y2={210 - c.l} stroke={bull ? T.green : T.red} strokeWidth="1.2" />
+                    <rect x={x - 5} y={bodyTop} width={10} height={bodyH} fill={bull ? T.green : T.red} rx={1} opacity={0.7} />
+                  </g>;
+                })}
+                {/* Fast MA (20) — gold line following price closely */}
+                <polyline points="25,66 46,62 67,70 88,64 109,72 130,67 151,56 172,60 193,53 214,46 235,50 256,58 277,52 298,43 319,48 340,40 361,33 382,36 403,30 424,23 445,26 466,20 487,16 508,13" fill="none" stroke={T.accent} strokeWidth="2" />
+                {/* Slow MA (50) — red dashed, smoother */}
+                <polyline points="25,68 46,66 67,65 88,63 109,62 130,60 151,58 172,56 193,54 214,52 235,50 256,48 277,46 298,44 340,40 361,38 382,36 403,34 424,32 445,30 466,28 487,26 508,24" fill="none" stroke={T.red} strokeWidth="2" strokeDasharray="6 3" />
+                {/* Crossover circle — where fast crosses above slow */}
+                <circle cx="130" cy="63" r="10" fill="none" stroke={T.yellow} strokeWidth="2" />
+                <line x1="144" y1="63" x2="180" y2="76" stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                <text x="183" y="80" style={{ fontSize: 9, fill: T.yellow, fontWeight: 700 }}>Golden Cross — bullish signal</text>
+                {/* Legend */}
+                <line x1="25" y1="10" x2="45" y2="10" stroke={T.accent} strokeWidth="2" />
+                <text x="49" y="13" style={{ fontSize: 9, fill: T.t2 }}>Fast MA (20)</text>
+                <line x1="140" y1="10" x2="160" y2="10" stroke={T.red} strokeWidth="2" strokeDasharray="4 2" />
+                <text x="164" y="13" style={{ fontSize: 9, fill: T.t2 }}>Slow MA (50)</text>
+                {/* Price above MA annotation */}
+                <text x="380" y="10" style={{ fontSize: 8, fill: T.green, fontWeight: 600 }}>Price above both MAs = Uptrend</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>When the fast MA crosses above the slow MA, it's called a <strong>Golden Cross</strong> (bullish). The reverse is a <strong>Death Cross</strong> (bearish). Crossovers lag — best used to confirm direction, not to time entries.</p>
+            </div>
+
+            {/* 4. Support & Resistance */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>4. Support, Resistance & Breakouts</div>
+              <svg viewBox="0 0 540 210" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                <line x1="25" y1="50" x2="510" y2="50" stroke={T.red} strokeWidth="1.5" strokeDasharray="6 3" />
+                <rect x="25" y="40" width="82" height="16" rx="3" fill={`${T.red}15`} /><text x="30" y="52" style={{ fontSize: 9, fill: T.red, fontWeight: 700 }}>RESISTANCE</text>
+                <line x1="25" y1="150" x2="510" y2="150" stroke={T.green} strokeWidth="1.5" strokeDasharray="6 3" />
+                <rect x="25" y="140" width="66" height="16" rx="3" fill={`${T.green}15`} /><text x="30" y="152" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>SUPPORT</text>
+                {/* Price bouncing between levels */}
+                <polyline points="40,100 65,60 80,55 95,58 120,95 145,140 160,145 175,142 200,100 225,60 240,55 255,58 280,95 305,140 320,145 335,142 365,65 385,55 405,50 425,42 445,35 465,30" fill="none" stroke={T.t1} strokeWidth="1.5" />
+                <text x="78" y="46" style={{ fontSize: 9, fill: T.red }}>Rejected</text>
+                <text x="145" y="166" style={{ fontSize: 9, fill: T.green }}>Bounced</text>
+                <text x="235" y="46" style={{ fontSize: 9, fill: T.red }}>Rejected</text>
+                <text x="305" y="166" style={{ fontSize: 9, fill: T.green }}>Bounced</text>
+                {/* Breakout zone */}
+                <rect x="395" y="28" width="80" height="26" rx="4" fill={`${T.yellow}12`} stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                <text x="405" y="40" style={{ fontSize: 9, fill: T.yellow, fontWeight: 700 }}>BREAKOUT</text>
+                <text x="405" y="50" style={{ fontSize: 8, fill: T.yellow }}>Above resistance</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>Price bounces between support and resistance until one breaks. <strong>False breakouts</strong> are common — always wait for confirmation (e.g. a close above/below the level with volume).</p>
+            </div>
+
+            {/* 5. FVG */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>5. Fair Value Gap (FVG)</div>
+              <svg viewBox="0 0 540 220" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Candle 1 */}
+                <line x1="120" y1="140" x2="120" y2="195" stroke={T.green} strokeWidth="2.5" />
+                <rect x="106" y="140" width="28" height="38" fill={T.green} rx="2" />
+                <text x="120" y="210" textAnchor="middle" style={{ fontSize: 9, fill: T.t3, fontWeight: 600 }}>Candle 1</text>
+                {/* Candle 2 — big move */}
+                <line x1="200" y1="38" x2="200" y2="135" stroke={T.green} strokeWidth="2.5" />
+                <rect x="186" y="38" width="28" height="75" fill={T.green} rx="2" />
+                <text x="200" y="210" textAnchor="middle" style={{ fontSize: 9, fill: T.t3, fontWeight: 600 }}>Candle 2</text>
+                <text x="200" y="28" textAnchor="middle" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>Big move!</text>
+                {/* Candle 3 */}
+                <line x1="280" y1="28" x2="280" y2="85" stroke={T.green} strokeWidth="2.5" />
+                <rect x="266" y="28" width="28" height="38" fill={T.green} rx="2" />
+                <text x="280" y="210" textAnchor="middle" style={{ fontSize: 9, fill: T.t3, fontWeight: 600 }}>Candle 3</text>
+                {/* FVG zone */}
+                <rect x="135" y="85" width="145" height="55" fill={`${T.purple}12`} stroke={T.purple} strokeWidth="1.5" strokeDasharray="4 2" rx="4" />
+                <text x="207" y="108" textAnchor="middle" style={{ fontSize: 11, fill: T.purple, fontWeight: 700 }}>FAIR VALUE GAP</text>
+                <text x="207" y="122" textAnchor="middle" style={{ fontSize: 8, fill: T.t3 }}>Gap between candle 1 high &amp; candle 3 low</text>
+                {/* Arrow showing price return */}
+                <path d="M 330,50 C 380,50 390,90 360,110" fill="none" stroke={T.yellow} strokeWidth="1.5" strokeDasharray="4 2" />
+                <text x="398" y="75" style={{ fontSize: 9, fill: T.yellow, fontWeight: 600 }}>Price may return</text>
+                <text x="398" y="88" style={{ fontSize: 9, fill: T.yellow }}>to fill this gap</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>FVGs form during aggressive moves where one side dominated. Price often revisits these zones — but in strong trends, they may never fill.</p>
+            </div>
+
+            {/* 6. RSI */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>6. RSI (Relative Strength Index)</div>
+              <svg viewBox="0 0 540 180" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Overbought/Oversold zones */}
+                <rect x="25" y="12" width="490" height="28" fill={`${T.red}08`} rx="2" />
+                <rect x="25" y="130" width="490" height="35" fill={`${T.green}08`} rx="2" />
+                <text x="35" y="28" style={{ fontSize: 9, fill: T.red, fontWeight: 700 }}>OVERBOUGHT (above 70)</text>
+                <text x="35" y="152" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>OVERSOLD (below 30)</text>
+                {/* Reference lines */}
+                <line x1="25" y1="40" x2="515" y2="40" stroke={T.red} strokeWidth="0.7" strokeDasharray="4 2" />
+                <line x1="25" y1="130" x2="515" y2="130" stroke={T.green} strokeWidth="0.7" strokeDasharray="4 2" />
+                <text x="518" y="43" style={{ fontSize: 8, fill: T.red, fontFamily: MONO }}>70</text>
+                <text x="518" y="133" style={{ fontSize: 8, fill: T.green, fontFamily: MONO }}>30</text>
+                <text x="518" y="88" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>50</text>
+                <line x1="25" y1="85" x2="515" y2="85" stroke={T.t4} strokeWidth="0.3" strokeDasharray="2 3" />
+                {/* RSI line */}
+                <polyline points="35,85 65,75 95,60 125,38 155,28 185,35 215,58 245,78 275,95 305,115 335,138 365,142 395,125 425,100 455,75 485,58" fill="none" stroke={T.purple} strokeWidth="2.5" />
+                {/* Annotations */}
+                <circle cx="155" cy="28" r="6" fill="none" stroke={T.red} strokeWidth="2" />
+                <text x="165" y="22" style={{ fontSize: 8, fill: T.red, fontWeight: 700 }}>Overbought — may reverse down</text>
+                <circle cx="365" cy="142" r="6" fill="none" stroke={T.green} strokeWidth="2" />
+                <text x="375" y="160" style={{ fontSize: 8, fill: T.green, fontWeight: 700 }}>Oversold — may bounce up</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>RSI shows momentum speed, NOT price direction. In strong trends it can stay overbought/oversold for weeks. Most useful in ranging/sideways markets. Always combine with other analysis.</p>
+            </div>
+
+            {/* 7. MACD */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>7. MACD (Moving Average Convergence Divergence)</div>
+              <svg viewBox="0 0 540 180" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                <line x1="25" y1="90" x2="515" y2="90" stroke={T.t4} strokeWidth="0.5" />
+                <text x="518" y="93" style={{ fontSize: 8, fill: T.t4, fontFamily: MONO }}>0</text>
+                {/* Histogram */}
+                {[5,8,12,16,12,7,3,-2,-7,-12,-16,-12,-7,-3,2,7,13,18,14,9].map((v, i) => (
+                  <rect key={i} x={32 + i * 24} y={v > 0 ? 90 - v * 3 : 90} width={18} height={Math.abs(v) * 3} fill={v >= 0 ? `${T.green}45` : `${T.red}45`} rx={2} />
+                ))}
+                {/* MACD line */}
+                <polyline points="41,58 65,50 89,42 113,35 137,42 161,52 185,62 209,75 233,95 257,105 281,112 305,102 329,88 353,75 377,65 401,50 425,38 449,30 473,40 497,50" fill="none" stroke={T.accent} strokeWidth="2" />
+                {/* Signal line */}
+                <polyline points="41,62 65,56 89,50 113,45 137,46 161,52 185,58 209,68 233,82 257,95 281,105 305,100 329,92 353,82 377,72 401,58 425,45 449,38 473,42 497,48" fill="none" stroke={T.red} strokeWidth="1.5" strokeDasharray="4 2" />
+                {/* Crossover annotations */}
+                <circle cx="185" cy="60" r="8" fill="none" stroke={T.yellow} strokeWidth="2" />
+                <text x="196" y="54" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>Bearish cross</text>
+                <circle cx="353" cy="78" r="8" fill="none" stroke={T.yellow} strokeWidth="2" />
+                <text x="364" y="72" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>Bullish cross</text>
+                {/* Legend */}
+                <line x1="32" y1="168" x2="52" y2="168" stroke={T.accent} strokeWidth="2" />
+                <text x="56" y="171" style={{ fontSize: 8, fill: T.t2 }}>MACD line</text>
+                <line x1="135" y1="168" x2="155" y2="168" stroke={T.red} strokeWidth="1.5" strokeDasharray="4 2" />
+                <text x="159" y="171" style={{ fontSize: 8, fill: T.t2 }}>Signal line</text>
+                <rect x="240" y="163" width="12" height="10" fill={`${T.green}45`} rx="1" />
+                <text x="256" y="171" style={{ fontSize: 8, fill: T.t3 }}>Histogram = gap between lines (momentum)</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>MACD crossovers indicate momentum shifts. Growing histogram = strengthening trend. Shrinking = fading. Crossovers are lagging — they confirm what happened, not predict what's next.</p>
+            </div>
+
+            {/* 8. Volume Analysis — NEW */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>8. Volume Analysis</div>
+              <p style={{ margin: "0 0 10px" }}>Volume shows <strong>how many shares/contracts</strong> were traded. High volume confirms moves; low volume suggests weakness. A breakout on heavy volume is more trustworthy than one on thin volume.</p>
+              <svg viewBox="0 0 540 220" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Price line */}
+                <polyline points="30,120 55,115 80,110 105,108 130,112 155,105 180,98 205,100 230,95 255,88 280,82 305,78 330,75 355,72 380,68 405,62 430,58 455,52 480,48 505,42" fill="none" stroke={T.t1} strokeWidth="1.5" />
+                <text x="510" y="40" style={{ fontSize: 8, fill: T.t3, fontFamily: MONO }}>Price</text>
+                {/* Volume bars */}
+                {[25,30,20,35,28,40,55,32,45,70,85,60,42,38,50,90,65,48,55,80].map((v, i) => {
+                  const x = 30 + i * 25;
+                  const up = i === 0 || [120,115,110,108,112,105,98,100,95,88,82,78,75,72,68,62,58,52,48,42][i] < [120,115,110,108,112,105,98,100,95,88,82,78,75,72,68,62,58,52,48,42][i-1];
+                  return <rect key={i} x={x - 8} y={200 - v} width={16} height={v} fill={up ? `${T.green}50` : `${T.red}50`} rx={1} />;
+                })}
+                {/* Annotations */}
+                <line x1="255" y1="110" x2="255" y2="145" stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                <text x="220" y="160" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>High volume = strong conviction</text>
+                <line x1="405" y1="100" x2="405" y2="125" stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                <text x="370" y="140" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>Climax volume on breakout</text>
+                <text x="30" y="215" style={{ fontSize: 8, fill: T.t4 }}>VOLUME</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>Rising price + rising volume = healthy trend. Rising price + falling volume = trend may be exhausting. Volume spikes often mark tops or bottoms.</p>
+            </div>
+
+            {/* 9. Bollinger Bands — NEW */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>9. Bollinger Bands</div>
+              <p style={{ margin: "0 0 10px" }}>Bollinger Bands plot a <strong>moving average</strong> with upper and lower bands at 2 standard deviations. Bands widen in volatile markets and narrow ("squeeze") before big moves.</p>
+              <svg viewBox="0 0 540 200" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Band fill */}
+                <path d="M 30,55 55,58 80,60 105,65 130,75 155,78 180,72 205,62 230,55 255,50 280,42 305,38 330,45 355,55 380,62 405,58 430,50 455,42 480,35 505,30 505,140 480,150 455,155 430,158 405,160 380,162 355,158 330,152 305,145 280,140 255,142 230,148 205,155 180,160 155,158 130,152 105,148 80,142 55,138 30,130 Z" fill={`${T.accent}08`} />
+                {/* Upper band */}
+                <polyline points="30,55 55,58 80,60 105,65 130,75 155,78 180,72 205,62 230,55 255,50 280,42 305,38 330,45 355,55 380,62 405,58 430,50 455,42 480,35 505,30" fill="none" stroke={T.accent} strokeWidth="1" strokeDasharray="4 2" opacity="0.6" />
+                {/* Lower band */}
+                <polyline points="30,130 55,138 80,142 105,148 130,152 155,158 180,160 205,155 230,148 255,142 280,140 305,145 330,152 355,158 380,162 405,160 430,158 455,155 480,150 505,140" fill="none" stroke={T.accent} strokeWidth="1" strokeDasharray="4 2" opacity="0.6" />
+                {/* Middle band (SMA) */}
+                <polyline points="30,92 55,98 80,101 105,106 130,114 155,118 180,116 205,108 230,102 255,96 280,91 305,91 330,98 355,106 380,112 405,109 430,104 455,98 480,92 505,85" fill="none" stroke={T.accent} strokeWidth="1.5" />
+                {/* Price */}
+                <polyline points="30,88 55,95 80,110 105,120 130,125 155,130 180,115 205,98 230,90 255,85 280,78 305,82 330,95 355,110 380,125 405,118 430,100 455,88 480,80 505,72" fill="none" stroke={T.t1} strokeWidth="2" />
+                {/* Squeeze annotation */}
+                <rect x="240" y="165" width="80" height="22" rx="4" fill={`${T.yellow}12`} stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                <text x="250" y="178" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>SQUEEZE</text>
+                <line x1="280" y1="165" x2="280" y2="148" stroke={T.yellow} strokeWidth="1" strokeDasharray="3 2" />
+                {/* Touch upper band */}
+                <circle cx="155" cy="130" r="6" fill="none" stroke={T.red} strokeWidth="1.5" />
+                <text x="100" y="145" style={{ fontSize: 8, fill: T.red }}>Touching lower band</text>
+                {/* Legend */}
+                <line x1="30" y1="195" x2="50" y2="195" stroke={T.t1} strokeWidth="2" />
+                <text x="54" y="198" style={{ fontSize: 8, fill: T.t2 }}>Price</text>
+                <line x1="100" y1="195" x2="120" y2="195" stroke={T.accent} strokeWidth="1.5" />
+                <text x="124" y="198" style={{ fontSize: 8, fill: T.t2 }}>SMA (20)</text>
+                <line x1="195" y1="195" x2="215" y2="195" stroke={T.accent} strokeWidth="1" strokeDasharray="4 2" opacity="0.6" />
+                <text x="219" y="198" style={{ fontSize: 8, fill: T.t2 }}>Upper/Lower bands (2σ)</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>Price touching the upper band doesn't automatically mean "sell" — in strong trends, price can "walk the band" for extended periods. A <strong>squeeze</strong> (narrow bands) often precedes a big move in either direction.</p>
+            </div>
+
+            {/* 10. Trendlines & Channels — NEW */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>10. Trendlines & Channels</div>
+              <p style={{ margin: "0 0 10px" }}>Connect swing lows in an uptrend (or swing highs in a downtrend) to draw a trendline. Two parallel trendlines form a <strong>channel</strong>.</p>
+              <svg viewBox="0 0 540 200" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Uptrend channel fill */}
+                <path d="M 30,155 180,100 330,55 480,15 480,85 330,125 180,165 30,190 Z" fill={`${T.green}06`} />
+                {/* Lower trendline (support) */}
+                <line x1="30" y1="170" x2="510" y2="55" stroke={T.green} strokeWidth="1.5" strokeDasharray="6 3" />
+                {/* Upper trendline (resistance) */}
+                <line x1="30" y1="120" x2="510" y2="5" stroke={T.green} strokeWidth="1.5" strokeDasharray="6 3" opacity="0.5" />
+                {/* Price zigzag within channel */}
+                <polyline points="30,165 60,130 90,155 120,118 155,145 185,102 220,130 255,90 290,118 325,78 360,105 395,65 430,92 465,52 500,28" fill="none" stroke={T.t1} strokeWidth="1.8" />
+                {/* Touch points on lower trendline */}
+                {[[30,165],[90,155],[155,145],[220,130],[290,118]].map(([x,y], i) => <circle key={i} cx={x} cy={y} r="4" fill={T.green} opacity="0.7" />)}
+                {/* Annotations */}
+                <text x="380" y="100" style={{ fontSize: 9, fill: T.green, fontWeight: 600 }}>Support trendline</text>
+                <text x="380" y="50" style={{ fontSize: 9, fill: T.green, fontWeight: 600, opacity: 0.6 }}>Channel top</text>
+                <text x="30" y="195" style={{ fontSize: 8, fill: T.t3 }}>Each bounce off the trendline confirms its validity. More touches = stronger line.</text>
+              </svg>
+            </div>
+
+            {/* 11. Head & Shoulders — NEW */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>11. Head & Shoulders (Reversal Pattern)</div>
+              <p style={{ margin: "0 0 10px" }}>One of the most reliable reversal patterns. It forms after an uptrend with three peaks — the middle peak (head) is the highest. A break below the <strong>neckline</strong> confirms the reversal.</p>
+              <svg viewBox="0 0 540 210" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 8, padding: 4 }}>
+                {/* Price forming H&S */}
+                <polyline points="30,160 60,145 90,120 110,85 125,60 140,85 160,110 185,120 210,100 235,65 260,30 285,65 310,100 335,120 360,110 380,80 395,65 410,82 430,115 460,140 490,155 510,170" fill="none" stroke={T.t1} strokeWidth="2" />
+                {/* Neckline */}
+                <line x1="60" y1="120" x2="460" y2="120" stroke={T.yellow} strokeWidth="1.5" strokeDasharray="6 3" />
+                <text x="465" y="118" style={{ fontSize: 9, fill: T.yellow, fontWeight: 700 }}>Neckline</text>
+                {/* Labels */}
+                <text x="125" y="52" textAnchor="middle" style={{ fontSize: 9, fill: T.t2, fontWeight: 700 }}>Left Shoulder</text>
+                <text x="260" y="22" textAnchor="middle" style={{ fontSize: 10, fill: T.red, fontWeight: 700 }}>HEAD</text>
+                <text x="395" y="57" textAnchor="middle" style={{ fontSize: 9, fill: T.t2, fontWeight: 700 }}>Right Shoulder</text>
+                {/* Breakdown arrow */}
+                <line x1="460" y1="125" x2="490" y2="155" stroke={T.red} strokeWidth="2" />
+                <polygon points="490,155 483,148 493,148" fill={T.red} />
+                <text x="430" y="175" style={{ fontSize: 9, fill: T.red, fontWeight: 700 }}>Breakdown</text>
+                <text x="430" y="187" style={{ fontSize: 8, fill: T.t3 }}>confirms reversal</text>
+              </svg>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>The pattern is only confirmed when price breaks below the neckline. Measure the distance from head to neckline — that's the approximate target for the drop.</p>
+            </div>
+
+            {/* 12. Double Top & Double Bottom — NEW */}
+            <div style={{ marginBottom: 28 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: T.t1, marginBottom: 8, borderBottom: `1px solid ${T.bd}`, paddingBottom: 4 }}>12. Double Top & Double Bottom</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
+                {/* Double Top */}
+                <div style={{ background: T.bg, border: `1px solid ${T.bd}`, borderRadius: 8, padding: 8 }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: T.red, marginBottom: 4, textAlign: "center" }}>Double Top (Bearish)</div>
+                  <svg viewBox="0 0 240 130" style={{ width: "100%" }}>
+                    <polyline points="10,100 35,80 55,55 70,30 85,55 105,75 125,55 140,30 155,55 175,80 200,95 230,110" fill="none" stroke={T.t1} strokeWidth="2" />
+                    <line x1="10" y1="30" x2="230" y2="30" stroke={T.red} strokeWidth="1" strokeDasharray="4 2" opacity="0.5" />
+                    <line x1="10" y1="75" x2="230" y2="75" stroke={T.yellow} strokeWidth="1" strokeDasharray="4 2" />
+                    <text x="5" y="72" style={{ fontSize: 7, fill: T.yellow }}>Neckline</text>
+                    <text x="70" y="24" textAnchor="middle" style={{ fontSize: 8, fill: T.red, fontWeight: 700 }}>Top 1</text>
+                    <text x="140" y="24" textAnchor="middle" style={{ fontSize: 8, fill: T.red, fontWeight: 700 }}>Top 2</text>
+                    <text x="190" y="124" style={{ fontSize: 8, fill: T.red }}>Sell signal</text>
+                  </svg>
+                </div>
+                {/* Double Bottom */}
+                <div style={{ background: T.bg, border: `1px solid ${T.bd}`, borderRadius: 8, padding: 8 }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: T.green, marginBottom: 4, textAlign: "center" }}>Double Bottom (Bullish)</div>
+                  <svg viewBox="0 0 240 130" style={{ width: "100%" }}>
+                    <polyline points="10,30 35,50 55,75 70,100 85,75 105,55 125,75 140,100 155,75 175,50 200,35 230,20" fill="none" stroke={T.t1} strokeWidth="2" />
+                    <line x1="10" y1="100" x2="230" y2="100" stroke={T.green} strokeWidth="1" strokeDasharray="4 2" opacity="0.5" />
+                    <line x1="10" y1="55" x2="230" y2="55" stroke={T.yellow} strokeWidth="1" strokeDasharray="4 2" />
+                    <text x="5" y="52" style={{ fontSize: 7, fill: T.yellow }}>Neckline</text>
+                    <text x="70" y="115" textAnchor="middle" style={{ fontSize: 8, fill: T.green, fontWeight: 700 }}>Bottom 1</text>
+                    <text x="140" y="115" textAnchor="middle" style={{ fontSize: 8, fill: T.green, fontWeight: 700 }}>Bottom 2</text>
+                    <text x="190" y="16" style={{ fontSize: 8, fill: T.green }}>Buy signal</text>
+                  </svg>
+                </div>
+              </div>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>When price tests the same level twice and fails to break through, it often reverses. The pattern is confirmed when price breaks through the neckline (the interim high/low between the two peaks/troughs).</p>
+            </div>
+
+            {/* Closing box */}
+            <div style={{ background: `${T.purple}08`, border: `1px solid ${T.purple}18`, borderRadius: 6, padding: "14px 16px", fontSize: 11 }}>
+              <div style={{ fontWeight: 700, color: T.purple, marginBottom: 6 }}>Why patterns fail — and why that's normal</div>
+              <p style={{ margin: "0 0 6px", color: T.t2 }}>Every pattern visible on your chart is also visible to algorithms, institutions, and millions of other traders. Sometimes they trade with the pattern. Sometimes they deliberately trade against it — large players may push price through support to trigger stop-losses, then reverse.</p>
+              <p style={{ margin: "0 0 6px", color: T.t2 }}>Unexpected events — a central bank surprise, a geopolitical shock, an earnings miss — can override any technical setup instantly. The market doesn't know or care about your lines.</p>
+              <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>The best approach: treat every pattern as a probability, not a certainty. Use multiple confirming signals. Define your risk before acting. Accept that being wrong is part of the process — the goal is good process, not perfect prediction.</p>
+            </div>
           </div>
         </div>
       )}
@@ -1092,177 +1671,6 @@ export default function App() {
                 <CountryHeatmap region={region} news={news} selectedCountry={selCountry} onSelectCountry={setSelCountry} T={T} />
               </div>
               <div style={{ borderTop: `1px solid ${T.bd}` }}><ImpactPanel item={selNews} region={region} T={T} /></div>
-
-
-              {/* LEARN SECTION */}
-              <div style={{ borderTop: `1px solid ${T.bd}`, padding: "12px 16px" }}>
-                <details style={{ cursor: "pointer" }}>
-                  <summary style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: T.accent, marginBottom: 8, listStyle: "none", display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ fontSize: 12 }}>📚</span> LEARN: TRADING FUNDAMENTALS
-                    <span style={{ fontSize: 8, color: T.t4, fontWeight: 400, marginLeft: "auto" }}>click to expand</span>
-                  </summary>
-                  <div style={{ fontSize: 11, color: T.t2, lineHeight: 1.6, fontFamily: FONT }}>
-                    <div style={{ background: `${T.accent}08`, border: `1px solid ${T.accent}18`, borderRadius: 6, padding: "10px 12px", marginBottom: 14, fontSize: 10, color: T.accent }}>
-                      <strong>⚠ Disclaimer:</strong> This is educational content only, not financial advice. Technical analysis describes probabilities, not certainties. Markets can and do behave contrary to any pattern. Always manage risk.
-                    </div>
-
-                    {/* 1. CANDLESTICK ANATOMY */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>1. What is a Candlestick?</div>
-                      <p style={{ margin: "0 0 8px" }}>Each candlestick shows four data points for a time period: <strong>Open</strong> (starting price), <strong>High</strong> (peak), <strong>Low</strong> (trough), and <strong>Close</strong> (ending price).</p>
-                      <svg viewBox="0 0 520 260" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <line x1="100" y1="30" x2="100" y2="230" stroke={T.green} strokeWidth="2" />
-                        <rect x="75" y="70" width="50" height="120" fill={T.green} rx="3" />
-                        <line x1="130" y1="30" x2="158" y2="30" stroke={T.t3} strokeWidth="1" strokeDasharray="3 2" />
-                        <text x="162" y="34" style={{ fontSize: 10, fill: T.t1, fontFamily: MONO, fontWeight: 700 }}>HIGH — Highest price reached</text>
-                        <line x1="130" y1="70" x2="158" y2="60" stroke={T.t3} strokeWidth="1" strokeDasharray="3 2" />
-                        <text x="162" y="63" style={{ fontSize: 10, fill: T.green, fontFamily: MONO, fontWeight: 700 }}>CLOSE — Price went UP, so close is on top</text>
-                        <line x1="70" y1="190" x2="42" y2="190" stroke={T.t3} strokeWidth="1" strokeDasharray="3 2" />
-                        <text x="5" y="188" style={{ fontSize: 10, fill: T.t2, fontFamily: MONO, fontWeight: 700 }}>OPEN</text>
-                        <line x1="100" y1="230" x2="158" y2="230" stroke={T.t3} strokeWidth="1" strokeDasharray="3 2" />
-                        <text x="162" y="234" style={{ fontSize: 10, fill: T.t1, fontFamily: MONO, fontWeight: 700 }}>LOW — Lowest price reached</text>
-                        <text x="54" y="50" style={{ fontSize: 9, fill: T.t4, fontFamily: MONO }}>Upper Wick</text>
-                        <text x="54" y="218" style={{ fontSize: 9, fill: T.t4, fontFamily: MONO }}>Lower Wick</text>
-                        <text x="81" y="135" style={{ fontSize: 10, fill: "#fff", fontWeight: 700, fontFamily: MONO }}>BODY</text>
-                        <text x="60" y="252" style={{ fontSize: 11, fill: T.green, fontWeight: 700 }}>BULLISH (Green) — Closed higher than open</text>
-                        <line x1="360" y1="30" x2="360" y2="230" stroke={T.red} strokeWidth="2" />
-                        <rect x="335" y="70" width="50" height="120" fill={T.red} rx="3" />
-                        <text x="395" y="75" style={{ fontSize: 10, fill: T.red, fontFamily: MONO, fontWeight: 700 }}>OPEN (top)</text>
-                        <text x="395" y="195" style={{ fontSize: 10, fill: T.red, fontFamily: MONO, fontWeight: 700 }}>CLOSE (bottom)</text>
-                        <text x="320" y="252" style={{ fontSize: 11, fill: T.red, fontWeight: 700 }}>BEARISH (Red) — Closed lower than open</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>The <strong>body</strong> = open-to-close range. The <strong>wicks</strong> = full range. A long upper wick means sellers pushed price back down. A long lower wick means buyers stepped in. Small body + long wicks = indecision.</p>
-                    </div>
-
-                    {/* 2. CANDLE PATTERNS */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>2. Key Candle Patterns</div>
-                      <svg viewBox="0 0 520 190" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <line x1="50" y1="30" x2="50" y2="155" stroke={T.t2} strokeWidth="2" /><rect x="40" y="90" width="20" height="4" fill={T.t2} rx="1" />
-                        <text x="50" y="174" textAnchor="middle" style={{ fontSize: 10, fill: T.t1, fontWeight: 700 }}>Doji</text>
-                        <text x="50" y="184" textAnchor="middle" style={{ fontSize: 8, fill: T.yellow }}>Indecision — neither side won</text>
-                        <line x1="150" y1="50" x2="150" y2="155" stroke={T.green} strokeWidth="2" /><rect x="138" y="50" width="24" height="28" fill={T.green} rx="2" />
-                        <text x="150" y="174" textAnchor="middle" style={{ fontSize: 10, fill: T.t1, fontWeight: 700 }}>Hammer</text>
-                        <text x="150" y="184" textAnchor="middle" style={{ fontSize: 8, fill: T.green }}>Buyers fought back after a dip</text>
-                        <line x1="250" y1="30" x2="250" y2="155" stroke={T.red} strokeWidth="2" /><rect x="238" y="125" width="24" height="28" fill={T.red} rx="2" />
-                        <text x="250" y="174" textAnchor="middle" style={{ fontSize: 10, fill: T.t1, fontWeight: 700 }}>Shooting Star</text>
-                        <text x="250" y="184" textAnchor="middle" style={{ fontSize: 8, fill: T.red }}>Sellers rejected the high</text>
-                        <rect x="330" y="65" width="16" height="45" fill={T.red} rx="1" /><line x1="338" y1="55" x2="338" y2="120" stroke={T.red} strokeWidth="1.5" />
-                        <rect x="352" y="40" width="24" height="80" fill={T.green} rx="2" /><line x1="364" y1="28" x2="364" y2="130" stroke={T.green} strokeWidth="1.5" />
-                        <text x="350" y="174" textAnchor="middle" style={{ fontSize: 10, fill: T.t1, fontWeight: 700 }}>Bullish Engulfing</text>
-                        <text x="350" y="184" textAnchor="middle" style={{ fontSize: 8, fill: T.green }}>Green completely covers red</text>
-                        <rect x="440" y="60" width="16" height="45" fill={T.green} rx="1" /><line x1="448" y1="50" x2="448" y2="115" stroke={T.green} strokeWidth="1.5" />
-                        <rect x="462" y="35" width="24" height="85" fill={T.red} rx="2" /><line x1="474" y1="25" x2="474" y2="130" stroke={T.red} strokeWidth="1.5" />
-                        <text x="460" y="174" textAnchor="middle" style={{ fontSize: 10, fill: T.t1, fontWeight: 700 }}>Bearish Engulfing</text>
-                        <text x="460" y="184" textAnchor="middle" style={{ fontSize: 8, fill: T.red }}>Red completely covers green</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>Patterns suggest possible moves but require context. A hammer after a downtrend may signal reversal — but the next candle needs to confirm. One candle alone is never enough.</p>
-                    </div>
-
-                    {/* 3. MOVING AVERAGES */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>3. Moving Averages (MA)</div>
-                      <p style={{ margin: "0 0 8px" }}>A moving average smooths price data to reveal the trend. A <strong>fast MA</strong> (e.g. 20-period, gold line) reacts quickly. A <strong>slow MA</strong> (e.g. 50-period, red dashed) shows the bigger picture. When they cross, momentum may be shifting.</p>
-                      <svg viewBox="0 0 520 200" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        {[40,55,45,60,50,65,70,55,75,80,85,75,90,95,88,100,95,105,110,102,115,120,110,125].map((v, i) => {
-                          const x = 20 + i * 20; const y = 180 - v * 1.5; const h = 8 + Math.random() * 8;
-                          const up = i > 0 && v > [40,55,45,60,50,65,70,55,75,80,85,75,90,95,88,100,95,105,110,102,115,120,110,125][i-1];
-                          return <rect key={i} x={x-3} y={y} width={6} height={h} fill={up ? T.green : T.red} rx={1} opacity={0.4} />;
-                        })}
-                        <polyline points="30,148 50,132 70,138 90,125 110,130 130,118 150,112 170,128 190,108 210,100 230,92 250,105 270,85 290,78 310,88 330,72 350,80 370,65 390,58 410,68 430,52 450,45 470,55 490,40" fill="none" stroke={T.accent} strokeWidth="2" />
-                        <polyline points="30,155 50,150 70,148 90,142 110,140 130,135 150,130 170,128 190,122 210,118 230,112 250,108 270,102 290,98 310,95 330,90 350,85 370,80 390,76 410,72 430,68 450,64 470,60 490,58" fill="none" stroke={T.red} strokeWidth="2" strokeDasharray="6 3" />
-                        <circle cx="170" cy="128" r="8" fill="none" stroke={T.yellow} strokeWidth="2" />
-                        <text x="178" y="145" style={{ fontSize: 9, fill: T.yellow, fontWeight: 700 }}>Crossover — momentum may be shifting</text>
-                        <line x1="20" y1="15" x2="40" y2="15" stroke={T.accent} strokeWidth="2" /><text x="44" y="18" style={{ fontSize: 9, fill: T.t2 }}>Fast MA (20)</text>
-                        <line x1="130" y1="15" x2="150" y2="15" stroke={T.red} strokeWidth="2" strokeDasharray="4 2" /><text x="154" y="18" style={{ fontSize: 9, fill: T.t2 }}>Slow MA (50)</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>When price stays above the MA, trend is generally up. Crossovers can lag — by the time you see one, the move may be partly over. Best used to confirm direction, not to time entries precisely.</p>
-                    </div>
-
-                    {/* 4. SUPPORT & RESISTANCE + BREAKOUTS */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>4. Support, Resistance & Breakouts</div>
-                      <svg viewBox="0 0 520 200" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <line x1="20" y1="50" x2="500" y2="50" stroke={T.red} strokeWidth="1.5" strokeDasharray="6 3" />
-                        <rect x="20" y="42" width="78" height="14" rx="3" fill={`${T.red}18`} /><text x="24" y="52" style={{ fontSize: 9, fill: T.red, fontWeight: 700 }}>RESISTANCE</text>
-                        <line x1="20" y1="150" x2="500" y2="150" stroke={T.green} strokeWidth="1.5" strokeDasharray="6 3" />
-                        <rect x="20" y="142" width="62" height="14" rx="3" fill={`${T.green}18`} /><text x="24" y="152" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>SUPPORT</text>
-                        <polyline points="40,100 70,60 90,55 100,58 130,140 150,145 160,142 190,60 220,55 240,58 270,140 290,145 310,142 340,60 370,55 390,65 410,50 430,42 450,38" fill="none" stroke={T.t1} strokeWidth="1.5" />
-                        <text x="88" y="48" style={{ fontSize: 10, fill: T.red }}>↓ Rejected</text>
-                        <text x="148" y="165" style={{ fontSize: 10, fill: T.green }}>↑ Bounced</text>
-                        <text x="390" y="32" style={{ fontSize: 10, fill: T.yellow, fontWeight: 700 }}>BREAKOUT</text>
-                        <rect x="385" y="35" width="70" height="12" rx="3" fill={`${T.yellow}15`} /><text x="389" y="44" style={{ fontSize: 8, fill: T.yellow }}>Above resistance</text>
-                        <text x="20" y="190" style={{ fontSize: 9, fill: T.t3 }}>Price bounces between levels until one breaks. False breakouts are common — always wait for confirmation.</text>
-                      </svg>
-                    </div>
-
-                    {/* 5. FAIR VALUE GAP */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>5. Fair Value Gap (FVG)</div>
-                      <svg viewBox="0 0 520 220" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <line x1="120" y1="140" x2="120" y2="190" stroke={T.green} strokeWidth="2" /><rect x="108" y="140" width="24" height="35" fill={T.green} rx="2" />
-                        <text x="120" y="207" textAnchor="middle" style={{ fontSize: 9, fill: T.t4 }}>Candle 1</text>
-                        <line x1="200" y1="40" x2="200" y2="130" stroke={T.green} strokeWidth="2" /><rect x="188" y="40" width="24" height="70" fill={T.green} rx="2" />
-                        <text x="200" y="207" textAnchor="middle" style={{ fontSize: 9, fill: T.t4 }}>Candle 2</text>
-                        <text x="200" y="28" textAnchor="middle" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>Big aggressive move!</text>
-                        <line x1="280" y1="30" x2="280" y2="80" stroke={T.green} strokeWidth="2" /><rect x="268" y="30" width="24" height="35" fill={T.green} rx="2" />
-                        <text x="280" y="207" textAnchor="middle" style={{ fontSize: 9, fill: T.t4 }}>Candle 3</text>
-                        <rect x="135" y="80" width="130" height="60" fill={`${T.purple}15`} stroke={T.purple} strokeWidth="1" strokeDasharray="4 2" rx="4" />
-                        <text x="200" y="112" textAnchor="middle" style={{ fontSize: 11, fill: T.purple, fontWeight: 700 }}>FAIR VALUE GAP</text>
-                        <text x="200" y="127" textAnchor="middle" style={{ fontSize: 8, fill: T.t3 }}>No trading happened here — gap between candle 1 high and candle 3 low</text>
-                        <path d="M 330,50 Q 390,50 390,100 Q 390,120 345,115" fill="none" stroke={T.yellow} strokeWidth="1.5" strokeDasharray="4 2" markerEnd="none" />
-                        <text x="398" y="90" style={{ fontSize: 9, fill: T.yellow }}>Price may return</text>
-                        <text x="398" y="102" style={{ fontSize: 9, fill: T.yellow }}>to fill this gap</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>FVGs form during aggressive moves. They represent "unfair" pricing where one side dominated. Price often revisits these zones — but in strong trends, they may never fill. Not all gaps are created equal.</p>
-                    </div>
-
-                    {/* 6. RSI */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>6. RSI (Relative Strength Index)</div>
-                      <svg viewBox="0 0 520 165" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <rect x="20" y="10" width="480" height="30" fill={`${T.red}10`} /><rect x="20" y="120" width="480" height="35" fill={`${T.green}10`} />
-                        <text x="30" y="28" style={{ fontSize: 9, fill: T.red, fontWeight: 700 }}>OVERBOUGHT (above 70) — may slow/reverse</text>
-                        <text x="30" y="142" style={{ fontSize: 9, fill: T.green, fontWeight: 700 }}>OVERSOLD (below 30) — selling may be exhausted</text>
-                        <line x1="20" y1="40" x2="500" y2="40" stroke={T.red} strokeWidth=".5" strokeDasharray="4 2" />
-                        <line x1="20" y1="120" x2="500" y2="120" stroke={T.green} strokeWidth=".5" strokeDasharray="4 2" />
-                        <text x="504" y="43" style={{ fontSize: 8, fill: T.red }}>70</text><text x="504" y="123" style={{ fontSize: 8, fill: T.green }}>30</text>
-                        <polyline points="30,80 60,70 90,55 120,35 150,28 180,38 210,60 240,75 270,90 300,110 330,128 360,132 390,118 420,95 450,70 480,55" fill="none" stroke={T.purple} strokeWidth="2" />
-                        <circle cx="150" cy="28" r="5" fill={T.red} /><text x="160" y="22" style={{ fontSize: 8, fill: T.red }}>Overbought signal</text>
-                        <circle cx="360" cy="132" r="5" fill={T.green} /><text x="310" y="155" style={{ fontSize: 8, fill: T.green }}>Oversold signal</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>RSI shows momentum speed, NOT price direction. In strong trends it can stay overbought/oversold for weeks. Most useful in ranging/sideways markets. Always combine with other analysis.</p>
-                    </div>
-
-                    {/* 7. MACD */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: T.t1, marginBottom: 6 }}>7. MACD (Moving Average Convergence Divergence)</div>
-                      <svg viewBox="0 0 520 165" style={{ width: "100%", background: T.bg, borderRadius: 8, border: `1px solid ${T.bd}`, marginBottom: 6 }}>
-                        <line x1="20" y1="80" x2="500" y2="80" stroke={T.t4} strokeWidth=".5" /><text x="504" y="83" style={{ fontSize: 8, fill: T.t4 }}>0</text>
-                        {[5,8,12,15,10,6,2,-3,-8,-12,-15,-10,-6,-2,3,8,14,18,12,8].map((v, i) => (
-                          <rect key={i} x={30 + i * 23} y={v > 0 ? 80 - v * 3 : 80} width={16} height={Math.abs(v) * 3} fill={v >= 0 ? `${T.green}50` : `${T.red}50`} rx={1} />
-                        ))}
-                        <polyline points="38,50 61,42 84,35 107,30 130,38 153,48 176,58 199,72 222,90 245,98 268,105 291,95 314,82 337,70 360,62 383,45 406,32 429,25 452,35 475,45" fill="none" stroke={T.accent} strokeWidth="2" />
-                        <polyline points="38,55 61,50 84,45 107,40 130,42 153,48 176,55 199,65 222,80 245,90 268,98 291,95 314,88 337,78 360,68 383,55 406,42 429,35 452,38 475,42" fill="none" stroke={T.red} strokeWidth="1.5" strokeDasharray="4 2" />
-                        <circle cx="176" cy="57" r="7" fill="none" stroke={T.yellow} strokeWidth="2" /><text x="184" y="50" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>Bearish crossover</text>
-                        <circle cx="337" cy="74" r="7" fill="none" stroke={T.yellow} strokeWidth="2" /><text x="345" y="67" style={{ fontSize: 8, fill: T.yellow, fontWeight: 700 }}>Bullish crossover</text>
-                        <line x1="30" y1="152" x2="50" y2="152" stroke={T.accent} strokeWidth="2" /><text x="54" y="155" style={{ fontSize: 8, fill: T.t2 }}>MACD line</text>
-                        <line x1="130" y1="152" x2="150" y2="152" stroke={T.red} strokeWidth="1.5" strokeDasharray="4 2" /><text x="154" y="155" style={{ fontSize: 8, fill: T.t2 }}>Signal line</text>
-                        <text x="240" y="155" style={{ fontSize: 8, fill: T.t3 }}>Histogram = gap between lines (momentum strength)</text>
-                      </svg>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>MACD crossovers indicate momentum shifts. Growing histogram = strengthening trend. Shrinking = fading. Crossovers are lagging — they confirm what happened, not predict what's next.</p>
-                    </div>
-
-                    {/* WHY PATTERNS FAIL */}
-                    <div style={{ background: `${T.purple}08`, border: `1px solid ${T.purple}18`, borderRadius: 6, padding: "12px 14px", fontSize: 11 }}>
-                      <div style={{ fontWeight: 700, color: T.purple, marginBottom: 6 }}>Why patterns fail — and why that's normal</div>
-                      <p style={{ margin: "0 0 6px", color: T.t2 }}>Every pattern visible on your chart is also visible to algorithms, institutions, and millions of other traders. Sometimes they trade with the pattern. Sometimes they deliberately trade against it — large players may push price through support to trigger stop-losses, then reverse.</p>
-                      <p style={{ margin: "0 0 6px", color: T.t2 }}>Unexpected events — a central bank surprise, a geopolitical shock, an earnings miss — can override any technical setup instantly. The market doesn't know or care about your lines.</p>
-                      <p style={{ margin: 0, color: T.t3, fontSize: 10 }}>The best approach: treat every pattern as a probability, not a certainty. Use multiple confirming signals. Define your risk before acting. Accept that being wrong is part of the process — the goal is good process, not perfect prediction.</p>
-                    </div>
-                  </div>
-                </details>
-              </div>
             </div>
 
             {/* RIGHT: NEWS */}
